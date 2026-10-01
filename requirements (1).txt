@@ -1,0 +1,5 @@
+selenium>=4.20
+beautifulsoup4
+lxml
+pandas
+openpyxl

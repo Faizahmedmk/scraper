@@ -1,0 +1,8 @@
+chrome_profile/
+browser_profile/
+__pycache__/
+output/
+.env
+node_modules/
+*.xlsx
+reviews.csv
