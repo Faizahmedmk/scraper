@@ -3,11 +3,12 @@
 Leads live in MariaDB (see db.py). Local run:  python app.py
 cPanel: passenger_wsgi.py imports `app` from this file.
 """
-import hmac, io, os, threading, webbrowser
+import hmac, io, logging, os, threading, webbrowser
 from datetime import datetime
 
 from flask import Flask, Response, jsonify, request, send_file
 
+import applog
 import config
 import db
 
@@ -16,6 +17,8 @@ try:                      # needs selenium/bs4/lxml; optional on the server
 except ImportError:
     scraper = None
 
+applog.setup()
+logger = logging.getLogger("leads")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 JOB = {"state": "idle", "log": [], "total": 0, "done": 0, "current": "", "reviews": 0, "failed": 0}
@@ -44,16 +47,19 @@ def _same(a, b):
 def guard():
     if request.path == "/health":
         return None
-    if request.path == "/api/ingest":
+    if request.path in ("/api/ingest", "/api/log"):
         if not config.INGEST_API_KEY:
             return jsonify(error="INGEST_API_KEY is not configured on the server."), 503
         if not _same(request.headers.get("x-api-key", ""), config.INGEST_API_KEY):
+            logger.warning("%s rejected: bad API key from %s", request.path, request.remote_addr)
             return jsonify(error="Invalid API key."), 401
         return None
     if not config.APP_PASSWORD:
         return Response("APP_PASSWORD is not configured on the server.", 503)
     a = request.authorization
     if not (a and _same(a.username or "", config.APP_USER) and _same(a.password or "", config.APP_PASSWORD)):
+        if a:
+            logger.warning("Failed dashboard login from %s", request.remote_addr)
         return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Lead dashboard"'})
     return None
 
@@ -63,7 +69,7 @@ def on_error(e):
     from werkzeug.exceptions import HTTPException
     if isinstance(e, HTTPException):
         return e
-    app.logger.exception("Unhandled error")
+    logger.exception("Unhandled error on %s %s", request.method, request.path)
     return jsonify(error=str(e)), 500
 
 
@@ -77,6 +83,7 @@ def worker(p):
         JOB["state"] = "stopped" if STOP.is_set() else "finished"
         log("Stopped by user." if STOP.is_set() else "Finished.")
     except BaseException as e:   # includes SystemExit from the scraper
+        logger.exception("Scrape job failed")
         JOB["state"] = "error"; log(f"ERROR: {e}")
 
 
@@ -132,8 +139,9 @@ def api_stop():
 
 @app.get("/api/status")
 def api_status():
-    return jsonify({k: JOB[k] for k in ("state", "total", "done", "current", "reviews", "failed")}
-                   | {"log": JOB["log"][-300:], "scraper_enabled": scraper_enabled()})
+    out = {k: JOB[k] for k in ("state", "total", "done", "current", "reviews", "failed")}
+    out.update(log=JOB["log"][-300:], scraper_enabled=scraper_enabled())
+    return jsonify(out)
 
 
 # ---------------------------------------------------------------- leads
@@ -145,7 +153,26 @@ def api_ingest():
     if not isinstance(rows, list):
         return jsonify(error='Body must be JSON like {"rows": [...]}'), 400
     n = db.upsert_leads([r for r in rows if isinstance(r, dict)])
+    logger.info("Ingest stored %d of %d rows", n, len(rows))
     return jsonify(ok=True, stored=n)
+
+
+@app.get("/api/log")
+def api_log():
+    """Last N lines of logs/app.log (x-api-key protected). Used by the lead site."""
+    try:
+        n = max(10, min(int(request.args.get("lines", 200)), 1000))
+    except ValueError:
+        n = 200
+    lines = []
+    try:
+        with open(applog.LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            lines = f.read().decode("utf-8", "replace").splitlines()[-n:]
+    except OSError:
+        pass
+    return jsonify(lines=lines)
 
 
 @app.get("/api/results")
