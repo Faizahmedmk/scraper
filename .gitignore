@@ -1,8 +1,9 @@
 chrome_profile/
 browser_profile/
 __pycache__/
+*.pyc
 output/
 .env
 node_modules/
 *.xlsx
-reviews.csv
+venv/

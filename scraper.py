@@ -1,4 +1,4 @@
-﻿"""
+"""
 Clutch review scraper (Selenium).
 
 Chrome is started as a normal browser process and Selenium attaches to it.
@@ -9,10 +9,9 @@ Usage:
   python scraper.py --category "https://clutch.co/developers" --min-rating 5 --max-rating 5
   python scraper.py --export-only --min-rating 4.5        # re-filter without scraping
 """
-import argparse, os, random, shutil, socket, subprocess, sys, time
+import argparse, csv, os, random, shutil, socket, subprocess, sys, time
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 
-import pandas as pd
 from clutch_parser import COLUMNS, parse_company_links, parse_reviews
 
 PORT = 9222
@@ -23,7 +22,8 @@ DONE_TXT = os.path.join(OUT_DIR, "done_companies.txt")
 
 
 # ---------------------------------------------------------------- browser
-def find_chrome():
+def chrome_path():
+    """Path to Chrome, or None if it is not installed."""
     cands = [
         os.environ.get("CHROME_PATH"),
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -35,7 +35,14 @@ def find_chrome():
     for c in cands:
         if c and os.path.exists(c):
             return c
-    sys.exit("Chrome not found. Set the CHROME_PATH environment variable to chrome.exe.")
+    return None
+
+
+def find_chrome():
+    c = chrome_path()
+    if not c:
+        sys.exit("Chrome not found. Set the CHROME_PATH environment variable to chrome.exe.")
+    return c
 
 
 def port_open(port):
@@ -134,17 +141,26 @@ def scrape_company(fetch, url, max_pages=40):
     return name, expected, rows
 
 
+KEY_COLS = ("company_url", "review_title", "reviewer_name", "review_date")
+
+
+def read_raw():
+    if not os.path.exists(RAW_CSV):
+        return []
+    with open(RAW_CSV, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
 def append_raw(rows):
     """Adds rows to all_reviews.csv, replacing older copies of the same review."""
     os.makedirs(OUT_DIR, exist_ok=True)
-    df = pd.DataFrame(rows, columns=COLUMNS)
-    if os.path.exists(RAW_CSV):
-        try:
-            df = pd.concat([pd.read_csv(RAW_CSV), df], ignore_index=True)
-        except Exception:
-            pass
-    df = df.drop_duplicates(subset=["company_url", "review_title", "reviewer_name", "review_date"], keep="last")
-    df.to_csv(RAW_CSV, index=False, encoding="utf-8-sig")
+    merged = {}
+    for r in read_raw() + list(rows):
+        merged[tuple(str(r.get(k, "")) for k in KEY_COLS)] = {c: r.get(c, "") for c in COLUMNS}
+    with open(RAW_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(merged.values())
 
 
 def load_done():
@@ -160,31 +176,36 @@ def mark_done(url):
 
 # ---------------------------------------------------------------- export
 def export(min_r, max_r):
-    if not os.path.exists(RAW_CSV):
+    rows = read_raw()
+    if not rows:
         print("No data yet. Run a scrape first.")
         return
-    df = pd.read_csv(RAW_CSV)
-    df = df.drop_duplicates(subset=["company_url", "review_title", "reviewer_name", "review_date"])
-    total = len(df)
-    df = df[df["rating"].between(min_r, max_r)]
-    print(f"{len(df)} of {total} reviews match rating {min_r} to {max_r}")
-    if df.empty:
+    keep = []
+    for r in rows:
+        try:
+            if min_r <= float(r["rating"]) <= max_r:
+                keep.append(r)
+        except (TypeError, ValueError):
+            pass
+    print(f"{len(keep)} of {len(rows)} reviews match rating {min_r} to {max_r}")
+    if not keep:
         return
-    base = os.path.join(OUT_DIR, f"reviews_{min_r}-{max_r}")
-    df.to_csv(base + ".csv", index=False, encoding="utf-8-sig")
-    try:
-        df.to_excel(base + ".xlsx", index=False)
-        print(f"Saved {base}.csv and {base}.xlsx")
-    except PermissionError:
-        print(f"Saved {base}.csv, but the .xlsx is open in Excel. Close it and run again.")
+    path = os.path.join(OUT_DIR, f"reviews_{min_r}-{max_r}.csv")
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        w.writerows(keep)
+    print(f"Saved {path}")
 
 
 # ---------------------------------------------------------------- run
 def run_scrape(category, max_companies=5, max_dir_pages=1, delay=(2, 4),
-               log=print, state=None, stop=None, resume=True):
+               log=print, state=None, stop=None, resume=True, save=None):
     """Scrapes every review of the first companies in a category into all_reviews.csv.
     `state` (a dict) is updated with progress so a UI can display it.
-    resume=False re-reads every company (used for scheduled refreshes)."""
+    resume=False re-reads every company (used for scheduled refreshes).
+    `save(rows)` stores each company's reviews; defaults to output/all_reviews.csv."""
+    save = save or append_raw
     state = state if state is not None else {}
     state.update(total=0, done=0, current="", reviews=0, failed=0)
     log("Starting Chrome...")
@@ -211,7 +232,7 @@ def run_scrape(category, max_companies=5, max_dir_pages=1, delay=(2, 4),
                 log(f"[{i}/{len(links)}] FAILED {link}: {e}")
                 state["failed"] = state.get("failed", 0) + 1
                 continue
-            append_raw(rows)
+            save(rows)
             mark_done(link)
             state["done"] += 1
             state["reviews"] += len(rows)

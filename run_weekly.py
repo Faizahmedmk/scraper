@@ -1,25 +1,27 @@
 """
-Weekly job: scrape Clutch, then PUSH the reviews to an n8n webhook.
-n8n writes them into Google Sheets. Schedule this file with Windows Task Scheduler.
+Weekly job: scrape Clutch with local Chrome, then PUSH the leads to the cPanel app,
+which stores them in MariaDB. Schedule this file with Windows Task Scheduler / cron.
 
   python run_weekly.py              full run: scrape + send
   python run_weekly.py --send-only  skip scraping, send what is already in output/all_reviews.csv
+
+Settings (environment variables or .env, see .env.example):
+  INGEST_URL       https://<your-subdomain>/api/ingest
+  INGEST_API_KEY   must match INGEST_API_KEY on the server
 """
-import argparse, hashlib, json, os, sys, time, urllib.error, urllib.request
+import argparse, json, os, sys, time, urllib.error, urllib.request
 from datetime import datetime
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))   # so Task Scheduler finds ./output
-import pandas as pd
+os.chdir(os.path.dirname(os.path.abspath(__file__)))   # so schedulers find ./output
+import config
 import scraper
 
-# ===================== EDIT THESE =====================
-WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "https://n8n.moveneticsdigital.com/webhook-test/clutch-reviews")
-API_KEY = os.environ.get("N8N_API_KEY", "Im884BR8DfzVR0UvIW8ElZEU")    # must match the n8n 'Valid token?' node
-CATEGORY = "https://clutch.co/developers"
-MAX_COMPANIES = 7
-MAX_DIR_PAGES = 1
-MIN_RATING, MAX_RATING = 1, 3
-# ======================================================
+INGEST_URL = os.environ.get("INGEST_URL", "")
+API_KEY = config.INGEST_API_KEY
+CATEGORY = os.environ.get("CLUTCH_CATEGORY", "https://clutch.co/developers")
+MAX_COMPANIES = int(os.environ.get("CLUTCH_MAX_COMPANIES", "7"))
+MAX_DIR_PAGES = int(os.environ.get("CLUTCH_MAX_DIR_PAGES", "1"))
+BATCH = 500
 
 LOG_FILE = os.path.join(scraper.OUT_DIR, "weekly_log.txt")
 
@@ -32,62 +34,60 @@ def log(msg):
         f.write(line + "\n")
 
 
-def post(payload):
-    data = json.dumps(payload).encode("utf-8")
+def post(rows):
+    data = json.dumps({"rows": rows}).encode("utf-8")
     for attempt in range(1, 4):
-        req = urllib.request.Request(WEBHOOK_URL, data=data, method="POST",
+        req = urllib.request.Request(INGEST_URL, data=data, method="POST",
                                      headers={"Content-Type": "application/json", "x-api-key": API_KEY})
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
-                log(f"n8n answered HTTP {r.status}")
+                log(f"Server answered HTTP {r.status}: {r.read().decode()[:100]}")
                 return True
         except urllib.error.HTTPError as e:
-            log(f"n8n returned HTTP {e.code}: {e.read().decode()[:200]}")
+            log(f"Server returned HTTP {e.code}: {e.read().decode()[:200]}")
         except Exception as e:
-            log(f"Could not reach n8n: {e}")
+            log(f"Could not reach server: {e}")
         time.sleep(10 * attempt)
     return False
 
 
-def build_rows():
-    df = pd.read_csv(scraper.RAW_CSV)
-    df = df.drop_duplicates(subset=["company_url", "review_title", "reviewer_name", "review_date"])
-    df = df[df["rating"].between(MIN_RATING, MAX_RATING)].fillna("").copy()
-    df.insert(0, "review_id", [hashlib.md5("|".join(str(x) for x in (r.company_url, r.review_title, r.reviewer_name, r.review_date)).encode()).hexdigest()[:12]
-                               for r in df.itertuples()])
-    df["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    return json.loads(df.to_json(orient="records"))
+def send(rows):
+    for i in range(0, len(rows), BATCH):
+        if not post(rows[i:i + BATCH]):
+            return False
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--send-only", action="store_true")
     a = ap.parse_args()
-    if "PASTE_YOUR" in WEBHOOK_URL:
-        sys.exit("Set WEBHOOK_URL at the top of run_weekly.py (or the N8N_WEBHOOK_URL environment variable).")
+    if not INGEST_URL or not API_KEY:
+        sys.exit("Set INGEST_URL and INGEST_API_KEY (environment variables or .env).")
 
-    if not a.send_only:
-        log(f"Weekly run started: {CATEGORY}, {MAX_COMPANIES} companies, rating {MIN_RATING}-{MAX_RATING}")
-        if os.path.exists(scraper.RAW_CSV):      # start clean so only this run's companies are sent
-            os.replace(scraper.RAW_CSV, os.path.join(scraper.OUT_DIR, "all_reviews_previous.csv"))
-        state = {}
+    if a.send_only:
+        rows = scraper.read_raw()
+        log(f"Sending {len(rows)} saved reviews...")
+        ok = send(rows)
+    else:
+        log(f"Run started: {CATEGORY}, {MAX_COMPANIES} companies")
+        state, ok = {}, True
+
+        def save(rows):
+            nonlocal ok
+            scraper.append_raw(rows)         # local backup
+            ok = send(rows) and ok
+
         try:
             scraper.run_scrape(CATEGORY, MAX_COMPANIES, MAX_DIR_PAGES, (2, 4),
-                               log=log, state=state, resume=False)
-        except BaseException as e:               # includes SystemExit (e.g. Chrome not found)
+                               log=log, state=state, resume=False, save=save)
+        except BaseException as e:           # includes SystemExit (e.g. Chrome not found)
             log(f"Scrape crashed: {e}")
-            post({"status": "failed", "message": f"Scrape crashed: {e}", "count": 0, "rows": []})
             sys.exit(1)
-        if state.get("failed", 0) > 0 or not os.path.exists(scraper.RAW_CSV):
-            msg = f"{state.get('failed', 0)} company(ies) failed (verification page not solved?)"
-            log(msg)
-            post({"status": "failed", "message": msg, "count": 0, "rows": []})
-            sys.exit(1)
-
-    rows = build_rows()
-    log(f"Sending {len(rows)} reviews to n8n...")
-    ok = post({"status": "ok", "message": "", "category": CATEGORY, "count": len(rows), "rows": rows})
-    log("Done." if ok else "FAILED to deliver to n8n.")
+        if state.get("failed", 0) > 0:
+            log(f"{state['failed']} company(ies) failed (verification page not solved?)")
+            ok = False
+    log("Done." if ok else "FINISHED WITH ERRORS.")
     sys.exit(0 if ok else 1)
 
 

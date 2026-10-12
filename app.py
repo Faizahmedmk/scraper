@@ -1,13 +1,23 @@
-"""Web UI for the Clutch review scraper.  Run:  python app.py  (opens http://127.0.0.1:5000)"""
-import hashlib, io, os, threading, webbrowser
+"""Lead dashboard + API (Flask, WSGI-ready for cPanel Passenger).
+
+Leads live in MariaDB (see db.py). Local run:  python app.py
+cPanel: passenger_wsgi.py imports `app` from this file.
+"""
+import hmac, io, os, threading, webbrowser
 from datetime import datetime
 
-import pandas as pd
 from flask import Flask, Response, jsonify, request, send_file
 
-import scraper
+import config
+import db
+
+try:                      # needs selenium/bs4/lxml; optional on the server
+    import scraper
+except ImportError:
+    scraper = None
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 JOB = {"state": "idle", "log": [], "total": 0, "done": 0, "current": "", "reviews": 0, "failed": 0}
 STOP = threading.Event()
 LOCK = threading.Lock()
@@ -16,35 +26,65 @@ TABLE_COLS = ["company", "review_title", "rating", "review_date", "reviewer_name
 BUCKETS = ["5.0", "4.5", "4.0", "3.5", "3.0", "Below 3"]
 
 
+def scraper_enabled():
+    return bool(config.ENABLE_SCRAPER and scraper is not None and scraper.chrome_path())
+
+
 def log(msg):
     JOB["log"].append(f"{datetime.now():%H:%M:%S}  {msg}")
     del JOB["log"][:-500]
 
 
+# ---------------------------------------------------------------- auth
+def _same(a, b):
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+@app.before_request
+def guard():
+    if request.path == "/health":
+        return None
+    if request.path == "/api/ingest":
+        if not config.INGEST_API_KEY:
+            return jsonify(error="INGEST_API_KEY is not configured on the server."), 503
+        if not _same(request.headers.get("x-api-key", ""), config.INGEST_API_KEY):
+            return jsonify(error="Invalid API key."), 401
+        return None
+    if not config.APP_PASSWORD:
+        return Response("APP_PASSWORD is not configured on the server.", 503)
+    a = request.authorization
+    if not (a and _same(a.username or "", config.APP_USER) and _same(a.password or "", config.APP_PASSWORD)):
+        return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Lead dashboard"'})
+    return None
+
+
+@app.errorhandler(Exception)
+def on_error(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("Unhandled error")
+    return jsonify(error=str(e)), 500
+
+
+# ---------------------------------------------------------------- scraping (optional)
 def worker(p):
     try:
         JOB["state"] = "starting"
         scraper.run_scrape(p["category"], p["max_companies"], p["max_dir_pages"],
-                           (2, 4), log=log, state=JOB, stop=STOP, resume=p["resume"])
+                           (2, 4), log=log, state=JOB, stop=STOP, resume=p["resume"],
+                           save=db.upsert_leads)
         JOB["state"] = "stopped" if STOP.is_set() else "finished"
         log("Stopped by user." if STOP.is_set() else "Finished.")
-    except SystemExit as e:
-        JOB["state"] = "error"; log(f"ERROR: {e}")
-    except Exception as e:
+    except BaseException as e:   # includes SystemExit from the scraper
         JOB["state"] = "error"; log(f"ERROR: {e}")
 
 
-def load_df():
+def rating_range():
     try:
-        df = pd.read_csv(scraper.RAW_CSV)
-    except Exception:
-        return pd.DataFrame(columns=scraper.COLUMNS)
-    return df.drop_duplicates(subset=["company_url", "review_title", "reviewer_name", "review_date"])
-
-
-def rating_filter(df):
-    lo = float(request.args.get("min", 0)); hi = float(request.args.get("max", 5))
-    return df[df["rating"].between(lo, hi)], lo, hi
+        return float(request.args.get("min", 0)), float(request.args.get("max", 5))
+    except ValueError:
+        return 0.0, 5.0
 
 
 def bucket(r):
@@ -58,8 +98,15 @@ def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
+@app.get("/health")
+def health():
+    return jsonify(ok=True)
+
+
 @app.post("/api/start")
 def api_start():
+    if not scraper_enabled():
+        return jsonify(error="Scraping is disabled on this server. Use run_weekly.py on a machine with Chrome."), 400
     d = request.get_json(force=True)
     cat = (d.get("category") or "").strip()
     if not cat.startswith("https://clutch.co/"):
@@ -86,40 +133,63 @@ def api_stop():
 @app.get("/api/status")
 def api_status():
     return jsonify({k: JOB[k] for k in ("state", "total", "done", "current", "reviews", "failed")}
-                   | {"log": JOB["log"][-300:]})
+                   | {"log": JOB["log"][-300:], "scraper_enabled": scraper_enabled()})
+
+
+# ---------------------------------------------------------------- leads
+@app.post("/api/ingest")
+def api_ingest():
+    """Receives leads pushed by run_weekly.py: {"rows": [ {...review...}, ... ]}"""
+    d = request.get_json(force=True, silent=True) or {}
+    rows = d.get("rows")
+    if not isinstance(rows, list):
+        return jsonify(error='Body must be JSON like {"rows": [...]}'), 400
+    n = db.upsert_leads([r for r in rows if isinstance(r, dict)])
+    return jsonify(ok=True, stored=n)
 
 
 @app.get("/api/results")
 def api_results():
-    df = load_df()
-    f, lo, hi = rating_filter(df)
-    counts = df["rating"].dropna().map(bucket).value_counts() if len(df) else pd.Series(dtype=int)
-    rows = f[TABLE_COLS].head(200).fillna("").to_dict("records")
-    return jsonify(total=len(df), companies=int(df["company_url"].nunique()) if len(df) else 0,
-                   matching=len(f), avg=round(float(f["rating"].mean()), 2) if len(f) else None,
-                   dist=[[b, int(counts.get(b, 0))] for b in BUCKETS], rows=rows)
+    lo, hi = rating_range()
+    st = db.stats(lo, hi)
+    counts = {}
+    for rating, n in st["dist"]:
+        counts[bucket(rating)] = counts.get(bucket(rating), 0) + n
+    rows = [{k: ("" if r[k] is None else r[k]) for k in TABLE_COLS} for r in db.fetch(lo, hi, 200)]
+    return jsonify(total=st["total"], companies=st["companies"], matching=st["matching"], avg=st["avg"],
+                   dist=[[b, counts.get(b, 0)] for b in BUCKETS], rows=rows)
 
 
 @app.get("/api/reviews")
 def api_reviews():
-    """All reviews in the rating range as JSON (used by n8n -> Google Sheets)."""
-    f, lo, hi = rating_filter(load_df())
-    f = f.fillna("").copy()
-    f.insert(0, "review_id", [hashlib.md5("|".join(str(x) for x in (r.company_url, r.review_title, r.reviewer_name, r.review_date)).encode()).hexdigest()[:12]
-                              for r in f.itertuples()])
-    f["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    return jsonify(count=len(f), rows=f.to_dict("records"))
+    """All leads in the rating range as JSON."""
+    lo, hi = rating_range()
+    rows = db.fetch(lo, hi)
+    return jsonify(count=len(rows), rows=rows)
 
 
 @app.get("/download/<kind>")
 def download(kind):
-    f, lo, hi = rating_filter(load_df())
+    lo, hi = rating_range()
+    rows = db.fetch(lo, hi)
+    cols = ["review_id"] + db.COLUMNS + ["last_updated"]
     name = f"reviews_{lo}-{hi}"
     if kind == "csv":
-        data = io.BytesIO(f.to_csv(index=False).encode("utf-8-sig"))
-        return send_file(data, mimetype="text/csv", as_attachment=True, download_name=name + ".csv")
+        import csv
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        w.writerows([["" if r[c] is None else r[c] for c in cols] for r in rows])
+        return send_file(io.BytesIO(buf.getvalue().encode("utf-8-sig")), mimetype="text/csv",
+                         as_attachment=True, download_name=name + ".csv")
+    from openpyxl import Workbook
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("reviews")
+    ws.append(cols)
+    for r in rows:
+        ws.append(["" if r[c] is None else r[c] for c in cols])
     data = io.BytesIO()
-    f.to_excel(data, index=False); data.seek(0)
+    wb.save(data); data.seek(0)
     return send_file(data, as_attachment=True, download_name=name + ".xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -128,9 +198,9 @@ def download(kind):
 def api_clear():
     if JOB["state"] in ("starting", "running"):
         return jsonify(error="Stop the scrape first."), 409
-    for path in (scraper.RAW_CSV, scraper.DONE_TXT):
-        if os.path.exists(path):
-            os.remove(path)
+    db.clear()
+    if scraper is not None and os.path.exists(scraper.DONE_TXT):
+        os.remove(scraper.DONE_TXT)
     JOB.update(state="idle", log=[], total=0, done=0, current="", reviews=0)
     return jsonify(ok=True)
 
@@ -175,6 +245,7 @@ th{position:sticky;top:0;background:#f0f3fa;text-align:left;padding:9px 10px;bor
   <input id="category" value="https://clutch.co/developers" style="margin-top:8px">
   <div class="row"><div><label>Companies</label><input id="mc" type="number" min="1" max="500" value="3"></div><div><label>Category pages</label><input id="mp" type="number" min="1" max="20" value="1"></div></div>
   <div class="btns"><button id="go" class="primary">Start scraping</button><button id="stop" disabled>Stop</button></div>
+  <div class="note" id="nosc" style="display:none">Scraping is disabled on this server. Run <b>run_weekly.py</b> on a machine with Chrome; it pushes leads here.</div>
   <div class="note">A Chrome window opens during a run. If Clutch shows a "verify you are human" check, solve it in that window and the scraper continues.</div>
   <div class="hint">The scraper collects every review of each company. The rating filter below is applied to the results and downloads.</div>
  </section>
@@ -216,7 +287,7 @@ async function poll(){
     const s=await (await fetch('/api/status')).json();
     const busy=s.state==='running'||s.state==='starting';
     const p=$('pill');p.textContent=s.state[0].toUpperCase()+s.state.slice(1);p.className='pill '+s.state;
-    $('go').disabled=busy;$('stop').disabled=!busy;
+    $('go').disabled=busy||!s.scraper_enabled;$('stop').disabled=!busy;$('nosc').style.display=s.scraper_enabled?'none':'block';
     const pct=s.total?Math.round(100*s.done/s.total):0;$('bar').style.width=pct+'%';$('pct').textContent=pct+'%';
     $('ptxt').textContent=busy?(s.total?`Company ${Math.min(s.done+1,s.total)} of ${s.total}${s.current?' ('+s.current+')':''}`:'Starting browser...'):(s.state==='idle'?'Ready':`${s.done} of ${s.total} companies done`);
     if(s.log.length){const el=$('log'),txt=s.log.join('\n');if(txt!==last){const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=txt;if(bottom)el.scrollTop=el.scrollHeight;last=txt;}}
@@ -237,7 +308,8 @@ loadResults();poll();
 
 
 if __name__ == "__main__":
-    host = os.environ.get("CLUTCH_HOST", "127.0.0.1")   # use 0.0.0.0 if n8n runs in Docker
+    # Local use only. On cPanel, Passenger loads passenger_wsgi.py instead.
+    host = os.environ.get("CLUTCH_HOST", "127.0.0.1")
     if not os.environ.get("CLUTCH_NO_BROWSER"):
         threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
     app.run(host=host, port=5000, debug=False)

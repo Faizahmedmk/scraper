@@ -1,0 +1,4 @@
+# Only for the machine that runs the Chrome scraper (run_weekly.py / scraper.py), not for cPanel.
+selenium>=4.20
+beautifulsoup4
+lxml
